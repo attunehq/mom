@@ -275,7 +275,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						output.content.push(block);
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "server_tool_use") {
-						// Server-side tool (web_search) - Anthropic executes this, not us.
+						// Server-side tool (web_search, web_fetch) - Anthropic executes this, not us.
 						// Store as opaque block for conversation history replay.
 						const serverBlock = event.content_block as any;
 						const block: Block = {
@@ -305,6 +305,33 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 							index: event.index,
 							// Stash raw block for conversation history replay
 							_webSearchToolResult: { tool_use_id: resultBlock.tool_use_id, content: resultBlock.content },
+						} as any;
+						output.content.push(block);
+						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+						stream.push({
+							type: "text_end",
+							contentIndex: output.content.length - 1,
+							content: textContent,
+							partial: output,
+						});
+					} else if ((event.content_block as any).type === "web_fetch_tool_result") {
+						// Web fetch results from Anthropic's server-side execution.
+						// Convert to text summary and stash raw block for replay.
+						const resultBlock = event.content_block as any;
+						let textContent: string;
+						if (resultBlock.content?.type === "web_fetch_result_error") {
+							textContent = `[Web fetch error: ${resultBlock.content.error_code ?? "unknown"}]`;
+						} else if (resultBlock.content?.type === "web_fetch_result") {
+							const url = resultBlock.content.url ?? "";
+							textContent = `[Fetched ${url}]`;
+						} else {
+							textContent = "[Web fetch completed]";
+						}
+						const block: Block = {
+							type: "text",
+							text: textContent,
+							index: event.index,
+							_webFetchToolResult: { tool_use_id: resultBlock.tool_use_id, content: resultBlock.content },
 						} as any;
 						output.content.push(block);
 						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
@@ -517,7 +544,7 @@ function createClient(
 	interleavedThinking: boolean,
 	optionsHeaders?: Record<string, string>,
 ): { client: Anthropic; isOAuthToken: boolean } {
-	const betaFeatures = ["fine-grained-tool-streaming-2025-05-14"];
+	const betaFeatures = ["fine-grained-tool-streaming-2025-05-14", "web-fetch-2025-09-10"];
 	if (interleavedThinking) {
 		betaFeatures.push("interleaved-thinking-2025-05-14");
 	}
@@ -616,8 +643,9 @@ function buildParams(
 	if (context.tools) {
 		params.tools = [
 			...convertTools(context.tools, isOAuthToken),
-			// Anthropic server-side web search tool - executed by Anthropic, not locally
+			// Anthropic server-side tools - executed by Anthropic, not locally
 			{ type: "web_search_20250305", name: "web_search" },
+			{ type: "web_fetch_20250910", name: "web_fetch" } as any,
 		];
 	}
 
@@ -726,6 +754,13 @@ function convertMessages(
 						type: "web_search_tool_result",
 						tool_use_id: anyBlock._webSearchToolResult.tool_use_id,
 						content: anyBlock._webSearchToolResult.content,
+					} as any);
+				} else if (anyBlock._webFetchToolResult) {
+					// Web fetch results stay in the assistant message (server-executed tool)
+					blocks.push({
+						type: "web_fetch_tool_result",
+						tool_use_id: anyBlock._webFetchToolResult.tool_use_id,
+						content: anyBlock._webFetchToolResult.content,
 					} as any);
 				} else if (block.type === "text") {
 					if (block.text.trim().length === 0) continue;

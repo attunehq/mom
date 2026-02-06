@@ -274,6 +274,46 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						};
 						output.content.push(block);
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "server_tool_use") {
+						// Server-side tool (web_search) - Anthropic executes this, not us.
+						// Store as opaque block for conversation history replay.
+						const serverBlock = event.content_block as any;
+						const block: Block = {
+							type: "text",
+							text: "",
+							index: event.index,
+							// Stash the raw server_tool_use block for replaying in conversation history
+							_serverToolUse: { id: serverBlock.id, name: serverBlock.name, input: serverBlock.input },
+						} as any;
+						output.content.push(block);
+					} else if (event.content_block.type === "web_search_tool_result") {
+						// Web search results from Anthropic's server-side execution.
+						// Convert to text so the agent can reference it, and stash raw block for replay.
+						const resultBlock = event.content_block as any;
+						const searchResults = Array.isArray(resultBlock.content)
+							? resultBlock.content
+									.filter((r: any) => r.type === "web_search_result")
+									.map((r: any) => `- ${r.title}\n  ${r.url}`)
+									.join("\n")
+							: "";
+						const textContent = searchResults
+							? `[Web search results]\n${searchResults}`
+							: "[Web search returned no results]";
+						const block: Block = {
+							type: "text",
+							text: textContent,
+							index: event.index,
+							// Stash raw block for conversation history replay
+							_webSearchToolResult: { tool_use_id: resultBlock.tool_use_id, content: resultBlock.content },
+						} as any;
+						output.content.push(block);
+						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+						stream.push({
+							type: "text_end",
+							contentIndex: output.content.length - 1,
+							content: textContent,
+							partial: output,
+						});
 					}
 				} else if (event.type === "content_block_delta") {
 					if (event.delta.type === "text_delta") {
@@ -574,7 +614,11 @@ function buildParams(
 	}
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools, isOAuthToken);
+		params.tools = [
+			...convertTools(context.tools, isOAuthToken),
+			// Anthropic server-side web search tool - executed by Anthropic, not locally
+			{ type: "web_search_20250305", name: "web_search" },
+		];
 	}
 
 	// Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
@@ -666,8 +710,27 @@ function convertMessages(
 		} else if (msg.role === "assistant") {
 			const blocks: ContentBlockParam[] = [];
 
+			// Track if we have server tool use blocks that need matching results in the user turn
+			const serverToolResults: any[] = [];
+
 			for (const block of msg.content) {
-				if (block.type === "text") {
+				const anyBlock = block as any;
+				if (anyBlock._serverToolUse) {
+					// Replay server_tool_use block as-is for Anthropic API
+					blocks.push({
+						type: "server_tool_use",
+						id: anyBlock._serverToolUse.id,
+						name: anyBlock._serverToolUse.name,
+						input: anyBlock._serverToolUse.input,
+					} as any);
+				} else if (anyBlock._webSearchToolResult) {
+					// Collect web search tool results - they go in the next user message
+					serverToolResults.push({
+						type: "web_search_tool_result",
+						tool_use_id: anyBlock._webSearchToolResult.tool_use_id,
+						content: anyBlock._webSearchToolResult.content,
+					});
+				} else if (block.type === "text") {
 					if (block.text.trim().length === 0) continue;
 					blocks.push({
 						type: "text",
@@ -698,6 +761,16 @@ function convertMessages(
 						input: block.arguments ?? {},
 					});
 				}
+			}
+
+			// If there are server tool results, they must be in a user message following the assistant message
+			if (serverToolResults.length > 0) {
+				if (blocks.length > 0) {
+					params.push({ role: "assistant", content: blocks });
+				}
+				// Server tool results go in a user message (same as regular tool results)
+				params.push({ role: "user", content: serverToolResults as any });
+				continue; // Skip the normal push below
 			}
 			if (blocks.length === 0) continue;
 			params.push({

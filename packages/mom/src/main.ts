@@ -242,6 +242,33 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 			});
 			await updatePromise;
 		},
+
+		postFinalMessage: async (text: string) => {
+			updatePromise = updatePromise.then(async () => {
+				// Delete the progress message and its thread replies first
+				for (let i = threadMessageTs.length - 1; i >= 0; i--) {
+					try {
+						await slack.deleteMessage(event.channel, threadMessageTs[i]);
+					} catch {
+						// Ignore errors deleting thread messages
+					}
+				}
+				threadMessageTs.length = 0;
+				if (messageTs) {
+					try {
+						await slack.deleteMessage(event.channel, messageTs);
+					} catch {
+						// Ignore - progress message may already be gone
+					}
+					messageTs = null;
+				}
+
+				// Then post the final result as a brand new message
+				const finalTs = await postNew(event.channel, text);
+				slack.logBotResponse(event.channel, text, finalTs);
+			});
+			await updatePromise;
+		},
 	};
 }
 

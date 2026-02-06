@@ -24,7 +24,7 @@ import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+const model = getModel("anthropic", "claude-opus-4-6");
 
 export interface PendingMessage {
 	userName: string;
@@ -167,7 +167,7 @@ function buildSystemPrompt(
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
 
-	return `You are mom, a Slack bot assistant. Be concise. No emojis.
+	return `You are pi, a Slack bot assistant. Be concise. No emojis.
 
 ## Context
 - For current date/time, use: date
@@ -550,12 +550,14 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
-					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
+					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main", false);
 				}
 
 				if (text.trim()) {
 					log.logResponse(logCtx, text);
-					queue.enqueueMessage(text, "main", "response main");
+					// Don't log to log.jsonl here - the final message posted via
+					// postFinalMessage will be logged there. This is just progress.
+					queue.enqueueMessage(text, "main", "response main", false);
 				}
 			}
 		} else if (event.type === "auto_compaction_start") {
@@ -741,11 +743,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// Wait for queued messages
 			await queueChain;
 
-			// Handle error case - update main message and post error to thread
+			// Handle error case - post error as new message, delete progress
 			if (runState.stopReason === "error" && runState.errorMessage) {
 				try {
-					await ctx.replaceMessage("_Sorry, something went wrong_");
-					await ctx.respondInThread(`_Error: ${runState.errorMessage}_`);
+					await ctx.postFinalMessage(`_Sorry, something went wrong: ${truncate(runState.errorMessage, 500)}_`);
 				} catch (err) {
 					const errMsg = err instanceof Error ? err.message : String(err);
 					log.logWarning("Failed to post error message", errMsg);
@@ -773,12 +774,12 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					try {
 						const mainText =
 							finalText.length > SLACK_MAX_LENGTH
-								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
+								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(truncated)_`
 								: finalText;
-						await ctx.replaceMessage(mainText);
+						await ctx.postFinalMessage(mainText);
 					} catch (err) {
 						const errMsg = err instanceof Error ? err.message : String(err);
-						log.logWarning("Failed to replace message with final text", errMsg);
+						log.logWarning("Failed to post final message", errMsg);
 					}
 				}
 			}

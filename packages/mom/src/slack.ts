@@ -1,3 +1,4 @@
+import { completeSimple, getModel } from "@mariozechner/pi-ai";
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
@@ -128,6 +129,75 @@ class ChannelQueue {
 }
 
 // ============================================================================
+// Watched Threads
+// ============================================================================
+
+const WATCHED_THREAD_MAX_AGE_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+const judgeModel = getModel("anthropic", "claude-haiku-4-5-20251001");
+
+interface ThreadMessage {
+	user: string;
+	text: string;
+	isBot: boolean;
+}
+
+/**
+ * Use a fast model to judge whether a thread reply is directed at mom.
+ * Returns true if the message seems intended for the bot.
+ */
+async function judgeThreadReply(
+	message: string,
+	senderName: string,
+	threadContext: ThreadMessage[],
+	apiKey: string,
+): Promise<boolean> {
+	const contextLines = threadContext
+		.slice(-10) // Last 10 messages for context
+		.map((m) => `${m.isBot ? "[mom]" : `[${m.user}]`}: ${m.text}`)
+		.join("\n");
+
+	const prompt = `You are a classifier. A Slack bot named "mom" (also known as "pi") is participating in a thread. A new reply just arrived. Decide if the reply is directed at mom or is requesting mom's help/action.
+
+Reply YES if:
+- The message asks mom/pi to do something
+- The message asks a question that seems directed at mom/pi
+- The message is a follow-up to something mom said (e.g. "can you also...", "what about...", "try again")
+- The message provides information mom asked for
+
+Reply NO if:
+- The message is clearly directed at another human in the thread
+- The message is commentary between humans about what mom said
+- The message is a reaction/emoji-like response not needing action (e.g. "nice", "thanks" with no follow-up)
+- The message mentions another bot by name
+
+Thread context:
+${contextLines}
+
+New reply from [${senderName}]: ${message}
+
+Respond with exactly YES or NO.`;
+
+	try {
+		const result = await completeSimple(
+			judgeModel,
+			{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+			{ apiKey },
+		);
+		const answer = result.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("")
+			.trim()
+			.toUpperCase();
+		return answer.startsWith("YES");
+	} catch (err) {
+		log.logWarning("Thread judge failed", err instanceof Error ? err.message : String(err));
+		return false; // Fail closed: don't respond if judge errors
+	}
+}
+
+// ============================================================================
 // SlackBot
 // ============================================================================
 
@@ -143,6 +213,8 @@ export class SlackBot {
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
 	private queues = new Map<string, ChannelQueue>();
+	/** Map of thread_ts -> channel_id for threads the bot has participated in */
+	private watchedThreads = new Map<string, string>();
 
 	constructor(
 		handler: MomHandler,
@@ -254,6 +326,79 @@ export class SlackBot {
 			attachments: [],
 			isBot: true,
 		});
+	}
+
+	// ==========================================================================
+	// Watched Threads
+	// ==========================================================================
+
+	/**
+	 * Register a thread as watched (bot has posted in it).
+	 * Also prunes old threads.
+	 */
+	registerWatchedThread(threadTs: string, channelId: string): void {
+		this.pruneWatchedThreads();
+		this.watchedThreads.set(threadTs, channelId);
+		log.logInfo(`Watching thread ${threadTs} in ${channelId}`);
+	}
+
+	/**
+	 * Check if a thread is watched.
+	 */
+	isWatchedThread(threadTs: string): boolean {
+		return this.watchedThreads.has(threadTs);
+	}
+
+	/**
+	 * Prune watched threads older than 30 days.
+	 * Slack timestamps are Unix epoch seconds (e.g., "1770355193.348509").
+	 */
+	private pruneWatchedThreads(): void {
+		const cutoff = Date.now() / 1000 - WATCHED_THREAD_MAX_AGE_SECONDS;
+		for (const [ts] of this.watchedThreads) {
+			if (parseFloat(ts) < cutoff) {
+				this.watchedThreads.delete(ts);
+			}
+		}
+	}
+
+	/**
+	 * Fetch recent messages from a thread for judge context.
+	 */
+	async getThreadMessages(channel: string, threadTs: string): Promise<ThreadMessage[]> {
+		try {
+			const result = await this.webClient.conversations.replies({
+				channel,
+				ts: threadTs,
+				limit: 15,
+			});
+			const messages = (result.messages || []) as Array<{
+				user?: string;
+				bot_id?: string;
+				text?: string;
+				ts?: string;
+			}>;
+			return messages.map((m) => {
+				const isBot = m.user === this.botUserId || !!m.bot_id;
+				const user = m.user ? this.users.get(m.user) : undefined;
+				return {
+					user: user?.userName || m.user || "unknown",
+					text: m.text || "",
+					isBot,
+				};
+			});
+		} catch (err) {
+			log.logWarning("Failed to fetch thread messages", err instanceof Error ? err.message : String(err));
+			return [];
+		}
+	}
+
+	/**
+	 * Get the API key for the thread judge.
+	 * Uses ANTHROPIC_API_KEY from environment.
+	 */
+	getApiKeyForJudge(): string | undefined {
+		return process.env.ANTHROPIC_API_KEY;
 	}
 
 	// ==========================================================================
@@ -426,8 +571,10 @@ export class SlackBot {
 				return;
 			}
 
-			// Only trigger handler for DMs
-			if (isDM) {
+			// Trigger handler for DMs or watched thread replies
+			const isWatchedThreadReply = !isDM && !!e.thread_ts && this.isWatchedThread(e.thread_ts);
+
+			if (isDM || isWatchedThreadReply) {
 				// Check for stop command - execute immediately, don't queue!
 				if (slackEvent.text.toLowerCase().trim() === "stop") {
 					if (this.handler.isRunning(e.channel)) {
@@ -440,7 +587,21 @@ export class SlackBot {
 				}
 
 				if (this.handler.isRunning(e.channel)) {
-					this.postMessage(e.channel, "_Already working. Say `stop` to cancel._");
+					if (isDM) {
+						this.postMessage(e.channel, "_Already working. Say `stop` to cancel._");
+					}
+					// For watched threads, silently skip if busy
+				} else if (isWatchedThreadReply) {
+					// For watched thread replies, run the judge asynchronously
+					const threadTs = e.thread_ts!;
+					const channelId = e.channel;
+					const apiKey = this.getApiKeyForJudge();
+					if (apiKey) {
+						// Run judge in background (don't block ack)
+						this.judgeAndProcess(slackEvent, channelId, threadTs, apiKey);
+					} else {
+						log.logWarning("No API key for thread judge, skipping watched thread reply");
+					}
 				} else {
 					this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
 				}
@@ -469,6 +630,44 @@ export class SlackBot {
 			isBot: false,
 		});
 		return attachments;
+	}
+
+	/**
+	 * Judge a watched thread reply and process it if directed at the bot.
+	 */
+	private async judgeAndProcess(
+		event: SlackEvent,
+		channelId: string,
+		threadTs: string,
+		apiKey: string,
+	): Promise<void> {
+		try {
+			const threadMessages = await this.getThreadMessages(channelId, threadTs);
+			const user = this.users.get(event.user);
+			const senderName = user?.userName || event.user;
+
+			const shouldRespond = await judgeThreadReply(event.text, senderName, threadMessages, apiKey);
+
+			if (shouldRespond) {
+				log.logInfo(`[${channelId}] Thread judge: YES for reply from ${senderName} in thread ${threadTs}`);
+
+				// Ensure the event is treated as a thread reply
+				event.thread_ts = threadTs;
+				event.replyInThread = true;
+				event.type = "mention";
+
+				if (this.handler.isRunning(channelId)) {
+					// Became busy during judge evaluation - silently skip
+					log.logInfo(`[${channelId}] Channel busy after judge, skipping thread reply`);
+				} else {
+					this.getQueue(channelId).enqueue(() => this.handler.handleEvent(event, this));
+				}
+			} else {
+				log.logInfo(`[${channelId}] Thread judge: NO for reply from ${senderName} in thread ${threadTs}`);
+			}
+		} catch (err) {
+			log.logWarning("Thread judge error", err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	// ==========================================================================

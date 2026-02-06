@@ -133,9 +133,13 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 	// Helper to post a message — in thread mode, always post as a thread reply
 	const postNew = async (channel: string, text: string): Promise<string> => {
 		if (useThread) {
-			return slack.postInThread(channel, threadParentTs, text);
+			const ts = await slack.postInThread(channel, threadParentTs, text);
+			// Register the thread so we get future replies without @-mention
+			slack.registerWatchedThread(threadParentTs, channel);
+			return ts;
 		}
-		return slack.postMessage(channel, text);
+		const ts = await slack.postMessage(channel, text);
+		return ts;
 	};
 
 	return {
@@ -266,6 +270,11 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 				// Then post the final result as a brand new message
 				const finalTs = await postNew(event.channel, text);
 				slack.logBotResponse(event.channel, text, finalTs);
+				// Register top-level bot messages as watched threads too,
+				// so replies to them are picked up without @-mention
+				if (!useThread) {
+					slack.registerWatchedThread(finalTs, event.channel);
+				}
 			});
 			await updatePromise;
 		},

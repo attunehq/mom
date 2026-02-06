@@ -297,10 +297,10 @@ export class SlackBot {
 
 			let text = e.text.replace(/<@[A-Z0-9]+>/gi, "").trim();
 
-			// Check for :thread: directive
-			const threadDirective = text.startsWith(":thread:");
+			// Check for :thread: directive anywhere in the message
+			const threadDirective = text.includes(":thread:");
 			if (threadDirective) {
-				text = text.slice(":thread:".length).trim();
+				text = text.replace(/:thread:/g, "").trim();
 			}
 
 			const slackEvent: SlackEvent = {
@@ -387,10 +387,10 @@ export class SlackBot {
 
 			let dmText = (e.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim();
 
-			// Check for :thread: directive in DMs too
-			const dmThreadDirective = dmText.startsWith(":thread:");
+			// Check for :thread: directive anywhere in DMs too
+			const dmThreadDirective = dmText.includes(":thread:");
 			if (dmThreadDirective) {
-				dmText = dmText.slice(":thread:".length).trim();
+				dmText = dmText.replace(/:thread:/g, "").trim();
 			}
 
 			const slackEvent: SlackEvent = {

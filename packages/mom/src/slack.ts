@@ -68,7 +68,7 @@ export interface SlackContext {
 	replaceMessage: (text: string) => Promise<void>;
 	respondInThread: (text: string) => Promise<void>;
 	setTyping: (isTyping: boolean) => Promise<void>;
-	uploadFile: (filePath: string, title?: string) => Promise<void>;
+	uploadFile: (filePath: string, title?: string, threadTs?: string) => Promise<void>;
 	setWorking: (working: boolean) => Promise<void>;
 	deleteMessage: () => Promise<void>;
 	postFinalMessage: (text: string) => Promise<void>;
@@ -211,15 +211,25 @@ export class SlackBot {
 		return result.ts as string;
 	}
 
-	async uploadFile(channel: string, filePath: string, title?: string): Promise<void> {
+	async uploadFile(channel: string, filePath: string, title?: string, threadTs?: string): Promise<void> {
 		const fileName = title || basename(filePath);
 		const fileContent = readFileSync(filePath);
-		await this.webClient.files.uploadV2({
-			channel_id: channel,
-			file: fileContent,
-			filename: fileName,
-			title: fileName,
-		});
+		if (threadTs) {
+			await this.webClient.files.uploadV2({
+				channel_id: channel,
+				thread_ts: threadTs,
+				file: fileContent,
+				filename: fileName,
+				title: fileName,
+			});
+		} else {
+			await this.webClient.files.uploadV2({
+				channel_id: channel,
+				file: fileContent,
+				filename: fileName,
+				title: fileName,
+			});
+		}
 	}
 
 	/**

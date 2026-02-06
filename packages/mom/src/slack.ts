@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore } from "./store.js";
+import { WatchedThreadStore } from "./watched-threads.js";
 
 // ============================================================================
 // Types
@@ -132,8 +133,6 @@ class ChannelQueue {
 // Watched Threads
 // ============================================================================
 
-const WATCHED_THREAD_MAX_AGE_SECONDS = 30 * 24 * 60 * 60; // 30 days
-
 const judgeModel = getModel("anthropic", "claude-haiku-4-5-20251001");
 
 interface ThreadMessage {
@@ -213,8 +212,7 @@ export class SlackBot {
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
 	private queues = new Map<string, ChannelQueue>();
-	/** Map of thread_ts -> channel_id for threads the bot has participated in */
-	private watchedThreads = new Map<string, string>();
+	private watchedThreads: WatchedThreadStore;
 
 	constructor(
 		handler: MomHandler,
@@ -225,6 +223,7 @@ export class SlackBot {
 		this.store = config.store;
 		this.socketClient = new SocketModeClient({ appToken: config.appToken });
 		this.webClient = new WebClient(config.botToken);
+		this.watchedThreads = new WatchedThreadStore(join(config.workingDir, "watched-threads.json"));
 	}
 
 	// ==========================================================================
@@ -334,11 +333,10 @@ export class SlackBot {
 
 	/**
 	 * Register a thread as watched (bot has posted in it).
-	 * Also prunes old threads.
+	 * Prunes old threads and persists to disk.
 	 */
 	registerWatchedThread(threadTs: string, channelId: string): void {
-		this.pruneWatchedThreads();
-		this.watchedThreads.set(threadTs, channelId);
+		this.watchedThreads.register(threadTs, channelId);
 		log.logInfo(`Watching thread ${threadTs} in ${channelId}`);
 	}
 
@@ -347,19 +345,6 @@ export class SlackBot {
 	 */
 	isWatchedThread(threadTs: string): boolean {
 		return this.watchedThreads.has(threadTs);
-	}
-
-	/**
-	 * Prune watched threads older than 30 days.
-	 * Slack timestamps are Unix epoch seconds (e.g., "1770355193.348509").
-	 */
-	private pruneWatchedThreads(): void {
-		const cutoff = Date.now() / 1000 - WATCHED_THREAD_MAX_AGE_SECONDS;
-		for (const [ts] of this.watchedThreads) {
-			if (parseFloat(ts) < cutoff) {
-				this.watchedThreads.delete(ts);
-			}
-		}
 	}
 
 	/**
